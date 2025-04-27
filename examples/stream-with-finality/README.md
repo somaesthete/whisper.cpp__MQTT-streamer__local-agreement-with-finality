@@ -1,5 +1,8 @@
 # stream-with-finality
 
+# USE
+USE_MQTT=1 ./examples/stream-with-finality/launchXpanesSplit.sh
+
 ## what
 
 stream-with-finality continuously infers on a sliding window of the last LENGTH ms at a cadence of STEP ms
