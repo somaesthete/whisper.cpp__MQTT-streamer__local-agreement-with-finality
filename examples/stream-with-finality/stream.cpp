@@ -19,6 +19,8 @@
 #include <array>
 #include <sstream>
 #include <numeric>
+#include <memory>
+#include <mqtt/async_client.h>
 #ifdef _WIN32
 #include <Winsock2.h>
 #include <Ws2tcpip.h>
@@ -72,6 +74,11 @@ struct whisper_params {
     string model     = "models/ggml-base.en.bin";
     string fname_out;
 
+    // MQTT params
+    string mqtt_broker = "tcp://127.0.0.1:1883";
+    string mqtt_client_id = "whisper_stream";
+    bool use_mqtt = true;
+
     // UDP socket stream params
     int32_t confirmed_tokens_port = 42000;
     int32_t raw_inference_frame_port = 42001;
@@ -119,6 +126,10 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
         else if (                  arg == "--giovanni-prompt-port")       { params.giovanni_prompt_port = stoi(argv[++i]); }
         else if (                  arg == "--udp-target-addr"    )        { params.udp_target_addr = argv[++i]; }
 
+        else if (arg == "--mqtt-broker") { params.mqtt_broker = argv[++i]; }
+        else if (arg == "--mqtt-client-id") { params.mqtt_client_id = argv[++i]; }
+        else if (arg == "--no-mqtt") { params.use_mqtt = false; }
+
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             whisper_print_usage(argc, argv, params);
@@ -156,8 +167,55 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -sa,      --save-audio    [%-7s] save the recorded audio to a file\n",              params.save_audio ? "true" : "false");
     fprintf(stderr, "  -ng,      --no-gpu        [%-7s] disable GPU inference\n",                          params.use_gpu ? "false" : "true");
     fprintf(stderr, "            --udp-target-addr        [%-7s] target addr for UDP msg\n",                        params.udp_target_addr.c_str());
+    fprintf(stderr, "  --mqtt-broker ADDR:PORT    MQTT broker address (default: %s)\n", params.mqtt_broker.c_str());
+    fprintf(stderr, "  --mqtt-client-id ID        MQTT client ID (default: %s)\n", params.mqtt_client_id.c_str());
+    fprintf(stderr, "  --no-mqtt                  Disable MQTT publishing\n");
     fprintf(stderr, "\n");
 }
+
+// MQTT client wrapper class
+class MQTTClient {
+private:
+    mqtt::async_client client;
+    mqtt::connect_options connOpts;
+    bool connected = false;
+
+public:
+    MQTTClient(const string& broker, const string& clientId) 
+        : client(broker, clientId) {
+        connOpts.set_clean_session(true);
+    }
+
+    bool connect() {
+        try {
+            client.connect(connOpts)->wait();
+            connected = true;
+            return true;
+        } catch (const mqtt::exception& exc) {
+            cerr << "MQTT connection error: " << exc.what() << endl;
+            return false;
+        }
+    }
+
+    void publish(const string& topic, const string& payload) {
+        if (!connected) return;
+        try {
+            client.publish(topic, payload.c_str(), payload.length(), 0, false)->wait();
+        } catch (const mqtt::exception& exc) {
+            cerr << "MQTT publish error: " << exc.what() << endl;
+        }
+    }
+
+    ~MQTTClient() {
+        if (connected) {
+            try {
+                client.disconnect()->wait();
+            } catch (const mqtt::exception& exc) {
+                cerr << "MQTT disconnect error: " << exc.what() << endl;
+            }
+        }
+    }
+};
 
 int main(int argc, char ** argv) {
     whisper_params params;
@@ -258,6 +316,16 @@ int main(int argc, char ** argv) {
     const int GIOVANI_PROMPT_PORT = 42010;
     bool is_running = true;
 
+    // Initialize MQTT client if enabled
+    unique_ptr<MQTTClient> mqttClient;
+    if (params.use_mqtt) {
+        mqttClient.reset(new MQTTClient(params.mqtt_broker, params.mqtt_client_id));
+        if (!mqttClient->connect()) {
+            fprintf(stderr, "Failed to connect to MQTT broker, continuing without MQTT\n");
+            params.use_mqtt = false;
+        }
+    }
+
     ofstream fout;
     if (params.fname_out.length() > 0) {
         fout.open(params.fname_out);
@@ -285,8 +353,6 @@ int main(int argc, char ** argv) {
     const auto t_start = t_last;
 
     auto last_fetch_time = chrono::steady_clock::now();
-
-    // bool is_running = true;
 
     // main audio loop
     while (is_running) {
@@ -432,6 +498,11 @@ int main(int argc, char ** argv) {
 
                     // send raw inference to the raw inference port (default 42001)
                     sendMessageToPort(params.udp_target_addr.c_str(), params.raw_inference_frame_port, text);
+                    
+                    // Publish raw inference to MQTT
+                    if (params.use_mqtt) {
+                        mqttClient->publish("whisper/raw_inference", text);
+                    }
 
                     // auto [newTokens, ctxBuffer, committed_tokens] = driverInst.drive(text);
 
@@ -440,7 +511,6 @@ int main(int argc, char ** argv) {
                     auto newTokens = std::get<0>(resultTuple);
                     auto ctxBuffer = std::get<1>(resultTuple);
                     auto committed_tokens = std::get<2>(resultTuple);
-
 
                     if (!newTokens.empty()) {
                         // Check if any token contains the word "giovanni"
@@ -489,8 +559,21 @@ int main(int argc, char ** argv) {
                         // Print the composed message
                         cout << message_ss.str() << endl;
 
-                        // Send confirmed tokens to the debug port (defualt 42000)
-                        sendMessageToPort(params.udp_target_addr.c_str(), params.confirmed_tokens_port, message_ss.str());
+                        // Convert committed_tokens vector to a single string
+                        std::string committed_tokens_str = std::accumulate(
+                            committed_tokens.begin(), committed_tokens.end(), std::string(),
+                            [](const std::string& a, const std::string& b) {
+                                return a.empty() ? b : a + " " + b;
+                            }
+                        );
+
+                        // send confirmed tokens to the confirmed tokens port (default 42000)
+                        sendMessageToPort(params.udp_target_addr.c_str(), params.confirmed_tokens_port, committed_tokens_str);
+                        
+                        // Publish confirmed tokens to MQTT
+                        if (params.use_mqtt) {
+                            mqttClient->publish("whisper/confirmed_tokens", committed_tokens_str);
+                        }
                     } else {
                         // Check if we should exit the listening state due to inactivity
                         auto current_time = chrono::steady_clock::now();
@@ -499,11 +582,20 @@ int main(int argc, char ** argv) {
 
                             // Concatenate and send the stored tokens if any
                             if (!giovanni_tokens.empty()) {
-                                std::string concatenated_tokens = std::accumulate(std::next(giovanni_tokens.begin()), giovanni_tokens.end(), giovanni_tokens[0],
-                                    [](std::string a, std::string b) { return std::move(a) + ' ' + b; });
+                                std::string concatenated_tokens = std::accumulate(
+                                    giovanni_tokens.begin(), giovanni_tokens.end(), std::string(),
+                                    [](const std::string& a, const std::string& b) {
+                                        return a.empty() ? b : a + " " + b;
+                                    }
+                                );
 
                                 // Send the concatenated string to GIOVANI_PROMPT_PORT (default 42010)
                                 sendMessageToPort(params.udp_target_addr.c_str(), params.giovanni_prompt_port, concatenated_tokens);
+
+                                // Publish giovanni prompt to MQTT
+                                if (params.use_mqtt) {
+                                    mqttClient->publish("whisper/giovanni_prompt", concatenated_tokens);
+                                }
 
                                 // Clear the stored tokens
                                 giovanni_tokens.clear();

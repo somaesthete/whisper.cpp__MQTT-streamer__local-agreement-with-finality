@@ -1,3 +1,24 @@
+cmake_minimum_required(VERSION 3.14)
+
+# Include FetchContent
+include(FetchContent)
+
+# Fetch and build Paho MQTT C client first
+FetchContent_Declare(
+    paho-mqtt-c
+    GIT_REPOSITORY https://github.com/eclipse/paho.mqtt.c.git
+    GIT_TAG v1.3.12
+)
+FetchContent_MakeAvailable(paho-mqtt-c)
+
+# Fetch and build Paho MQTT C++ client
+FetchContent_Declare(
+    paho-mqtt-cpp
+    GIT_REPOSITORY https://github.com/eclipse/paho.mqtt.cpp.git
+    GIT_TAG v1.2.0
+)
+FetchContent_MakeAvailable(paho-mqtt-cpp)
+
 if (WHISPER_SDL2)
     # stream
     set(TARGET stream-with-finality)
@@ -5,7 +26,23 @@ if (WHISPER_SDL2)
 
     include(DefaultTargetOptions)
 
-    target_link_libraries(${TARGET} PRIVATE common common-sdl whisper ${CMAKE_THREAD_LIBS_INIT})
+    # Add include directories for MQTT
+    target_include_directories(${TARGET} PRIVATE
+        ${paho-mqtt-cpp_SOURCE_DIR}/src
+        ${paho-mqtt-cpp_BINARY_DIR}/src
+        ${paho-mqtt-c_SOURCE_DIR}/src
+        ${paho-mqtt-c_BINARY_DIR}/src
+    )
+
+    # Link against MQTT libraries
+    target_link_libraries(${TARGET} PRIVATE 
+        common 
+        common-sdl 
+        whisper 
+        ${CMAKE_THREAD_LIBS_INIT} 
+        paho-mqttpp3
+        paho-mqtt3a
+    )
 endif ()
 
 set(CMAKE_CXX_STANDARD 17)
